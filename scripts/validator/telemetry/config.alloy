@@ -1,0 +1,245 @@
+logging {
+  level = "debug"
+  format = "logfmt"
+}
+
+loki.write "default" {
+  endpoint {
+    url = "https://basilica-logs.tplr.ai/loki/api/v1/push"
+  }
+}
+
+discovery.docker "containers" {
+  host = "unix:///var/run/docker.sock"
+}
+
+loki.source.docker "validator_logs" {
+  host       = "unix:///var/run/docker.sock"
+  targets    = discovery.docker.containers.targets
+  forward_to = [loki.process.filter_and_label.receiver]
+  relabel_rules = loki.relabel.docker_labels.rules
+}
+
+loki.relabel "docker_labels" {
+  forward_to = []
+
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "container_name"
+  }
+
+  rule {
+    source_labels = ["__meta_docker_container_id"]
+    target_label  = "container_id"
+  }
+
+  rule {
+    source_labels = ["__meta_docker_container_image"]
+    target_label  = "image"
+  }
+}
+
+loki.process "filter_and_label" {
+  forward_to = [loki.process.extract_validator_level.receiver]
+
+  // Add basic labels to all logs first
+  stage.static_labels {
+    values = {
+      job = "docker",
+      source = "docker",
+    }
+  }
+
+  // Add validator-specific labels only to basilica-validator logs
+  stage.match {
+    selector = `{container_name="basilica-validator"}`
+
+    stage.static_labels {
+      values = {
+        environment = "production",
+        component = "validator",
+        project = "basilica",
+        node_type = "validator",
+        deployment = "validator-prod",
+        validator_uid = env("VALIDATOR_UID"),
+        netuid = env("NETUID"),
+        external_ip = env("VALIDATOR_IP"),
+      }
+    }
+  }
+}
+
+loki.process "extract_validator_level" {
+  forward_to = [loki.process.extract_context_fields.receiver]
+
+  // Extract log level and target from all logs
+  stage.regex {
+    expression = `(?P<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z)\s+(?P<level>\w+)\s+(?P<target>[\w:]+):\s+(?P<message>.*)`
+  }
+
+  stage.labels {
+    values = {
+      level = "level",
+      target = "target",
+    }
+  }
+
+  // Mask sensitive data only for validator container logs
+  stage.match {
+    selector = `{container_name="basilica-validator"}`
+
+    // Mask IPv4 addresses
+    stage.replace {
+      expression = "[0-9]{1,3}\\.([0-9]{1,3})\\.([0-9]{1,3})\\.[0-9]{1,3}"
+      replace = "xxx"
+    }
+
+    // Mask IPv6 addresses
+    stage.replace {
+      expression = "[0-9a-fA-F]{1,4}:([0-9a-fA-F]{1,4}):([0-9a-fA-F]{1,4}):([0-9a-fA-F]{1,4}):([0-9a-fA-F]{1,4}):([0-9a-fA-F]{1,4}):([0-9a-fA-F]{1,4}):[0-9a-fA-F]{1,4}"
+      replace = "xxxx"
+    }
+
+    // Mask GPU IDs
+    stage.replace {
+      expression = "GPU-([0-9a-fA-F]{32})"
+      replace = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    }
+  }
+
+  // Mask sensitive data for file logs
+  stage.match {
+    selector = `{job="validator_files"}`
+
+    // Mask IPv4 addresses
+    stage.replace {
+      expression = "[0-9]{1,3}\\.([0-9]{1,3})\\.([0-9]{1,3})\\.[0-9]{1,3}"
+      replace = "xxx"
+    }
+
+    // Mask IPv6 addresses
+    stage.replace {
+      expression = "[0-9a-fA-F]{1,4}:([0-9a-fA-F]{1,4}):([0-9a-fA-F]{1,4}):([0-9a-fA-F]{1,4}):([0-9a-fA-F]{1,4}):([0-9a-fA-F]{1,4}):([0-9a-fA-F]{1,4}):[0-9a-fA-F]{1,4}"
+      replace = "xxxx"
+    }
+
+    // Mask GPU IDs
+    stage.replace {
+      expression = "GPU-([0-9a-fA-F]{32})"
+      replace = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    }
+  }
+}
+
+loki.source.file "validator_file_logs" {
+  targets = [
+    {
+      __path__ = "/var/log/basilica/*.log",
+      job      = "validator_files",
+      service  = "validator",
+    },
+  ]
+  forward_to = [loki.process.file_processor.receiver]
+}
+
+loki.process "file_processor" {
+  forward_to = [loki.process.extract_validator_level.receiver]
+
+  stage.regex {
+    expression = `(?P<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z)\s+(?P<level>\w+)\s+(?P<target>[\w:]+):\s+(?P<message>.*)`
+  }
+
+  stage.labels {
+    values = {
+      level = "level",
+      target = "target",
+    }
+  }
+
+  // Add fixed metadata labels for file logs with config-based information
+  stage.static_labels {
+    values = {
+      environment = "production",
+      component = "validator",
+      project = "basilica",
+      node_type = "validator",
+      deployment = "validator-prod",
+      log_source = "file",
+      validator_uid = env("VALIDATOR_UID"),
+      netuid = env("NETUID"),
+      external_ip = env("VALIDATOR_IP"),
+    }
+  }
+}
+
+// Extract miner_uid and executor_id from structured log fields
+loki.process "extract_context_fields" {
+  forward_to = [loki.write.default.receiver]
+
+  // Extract miner_uid from structured fields (e.g., "miner_uid = 123")
+  stage.regex {
+    expression = `miner_uid\s*=\s*(?P<miner_uid>\d+)`
+  }
+
+  // Extract executor_id from structured fields (UUID format: "executor_id = 550e8400-e29b-41d4-a716-446655440000")
+  stage.regex {
+    expression = `executor_id\s*=\s*(?P<executor_id>[a-fA-F0-9-]{36})`
+  }
+
+  // Extract gpu_category from structured fields (e.g., "gpu_category = H100")
+  stage.regex {
+    expression = `gpu_category\s*=\s*(?P<gpu_category>[\w]+)`
+  }
+
+  // Extract flow type from brackets (e.g., "[EVAL_FLOW]")
+  stage.regex {
+    expression = `\[(?P<flow>(EVAL_FLOW|WEIGHT_FLOW|SCORING_FLOW))\]`
+  }
+
+  // Apply all extracted fields as labels for Loki queries
+  stage.labels {
+    values = {
+      miner_uid = "miner_uid",
+      executor_id = "executor_id",
+      gpu_category = "gpu_category",
+      flow = "flow",
+    }
+  }
+}
+
+prometheus.exporter.unix "system" {
+  include_exporter_metrics = true
+}
+
+prometheus.scrape "system" {
+  targets    = prometheus.exporter.unix.system.targets
+  forward_to = [prometheus.remote_write.default.receiver]
+}
+
+// Scrape validator application metrics
+prometheus.scrape "validator" {
+  targets = [
+    {
+      __address__ = "validator:9090",
+      job         = "validator",
+      instance    = env("VALIDATOR_IP"),
+      validator_uid = env("VALIDATOR_UID"),
+      netuid      = env("NETUID"),
+      environment = "production",
+      component   = "validator",
+      project     = "basilica",
+      node_type   = "validator",
+      deployment  = "validator-prod",
+    },
+  ]
+  forward_to = [prometheus.remote_write.default.receiver]
+  scrape_interval = "15s"
+  metrics_path = "/metrics"
+}
+
+prometheus.remote_write "default" {
+  endpoint {
+    url = "https://basilica-telemetry.tplr.ai/api/v1/write"
+  }
+}

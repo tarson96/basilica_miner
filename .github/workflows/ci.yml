@@ -1,0 +1,471 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  RUSTUP_MAX_RETRIES: 10
+  RUSTFLAGS: "-Clink-arg=-fuse-ld=mold"
+  CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: "clang"
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  # Detect changes to determine which services need building
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      executor: ${{ steps.changes.outputs.executor }}
+      validator: ${{ steps.changes.outputs.validator }}
+      miner: ${{ steps.changes.outputs.miner }}
+      basilica-api: ${{ steps.changes.outputs.basilica-api }}
+      basilica-cli: ${{ steps.changes.outputs.basilica-cli }}
+      workspace: ${{ steps.changes.outputs.workspace }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v2
+        id: changes
+        with:
+          filters: |
+            executor:
+              - 'crates/basilica-executor/**'
+              - 'crates/basilica-common/**'
+              - 'crates/basilica-protocol/**'
+              - 'scripts/executor/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+            validator:
+              - 'crates/basilica-validator/**'
+              - 'crates/basilica-common/**'
+              - 'crates/basilica-protocol/**'
+              - 'scripts/validator/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+            miner:
+              - 'crates/basilica-miner/**'
+              - 'crates/basilica-common/**'
+              - 'crates/basilica-protocol/**'
+              - 'crates/bittensor/**'
+              - 'scripts/miner/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+            basilica-api:
+              - 'crates/basilica-api/**'
+              - 'crates/basilica-common/**'
+              - 'crates/basilica-protocol/**'
+              - 'scripts/api/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+            basilica-cli:
+              - 'crates/basilica-cli/**'
+              - 'crates/basilica-api/**'
+              - 'crates/basilica-common/**'
+              - 'crates/basilica-protocol/**'
+              - 'scripts/cli/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+            workspace:
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.github/workflows/**'
+
+  quick-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "shared-cache"
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "25.x"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Cache and install system dependencies
+        uses: awalsh128/cache-apt-pkgs-action@latest
+        with:
+          packages: pkg-config libssl-dev xxd mold clang
+          version: 1.0
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - name: Generate test key
+        run: |
+          chmod +x scripts/gen-key.sh
+          ./scripts/gen-key.sh
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Quick check builds
+        run: |
+          export VALIDATOR_PUBLIC_KEY=$(cat public_key.hex)
+          cargo check -p basilica-common -p basilica-protocol -p bittensor
+      - name: Run clippy on core packages
+        run: |
+          export VALIDATOR_PUBLIC_KEY=$(cat public_key.hex)
+          cargo clippy -p basilica-common -p basilica-protocol -p bittensor --all-targets -- -D warnings
+
+  # Lint complex packages
+  lint-complex:
+    runs-on: ubuntu-latest
+    needs: quick-checks
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "shared-cache"
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "25.x"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Cache and install system dependencies
+        uses: awalsh128/cache-apt-pkgs-action@latest
+        with:
+          packages: pkg-config libssl-dev xxd mold clang
+          version: 1.0
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - name: Generate test key
+        run: |
+          chmod +x scripts/gen-key.sh
+          ./scripts/gen-key.sh
+      - name: Run clippy on complex packages
+        run: |
+          export VALIDATOR_PUBLIC_KEY=$(cat public_key.hex)
+          # Run clippy without vulkan feature to avoid shaderc-sys CMake requirement
+          cargo clippy -p basilica-executor --all-targets --all-features -- -D warnings
+          # Run clippy on miner
+          cargo clippy -p basilica-miner --all-targets --all-features -- -D warnings
+          # Run clippy on validator
+          cargo clippy -p basilica-validator --all-targets --all-features -- -D warnings
+          # Run clippy on basilica-api
+          cargo clippy -p basilica-api --all-targets --all-features -- -D warnings
+          # Run clippy on basilica-cli
+          cargo clippy -p basilica-cli --all-targets --all-features -- -D warnings
+
+  # Build and test executor
+  build-executor:
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.executor == 'true' || needs.changes.outputs.workspace == 'true'
+    strategy:
+      matrix:
+        rust-version: [stable]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust-version }}
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "shared-cache"
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "25.x"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Cache and install system dependencies
+        uses: awalsh128/cache-apt-pkgs-action@latest
+        with:
+          packages: pkg-config libssl-dev xxd mold clang
+          version: 1.0
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - name: Set up Docker
+        uses: docker/setup-buildx-action@v3
+      - name: Generate test key
+        run: |
+          chmod +x scripts/gen-key.sh
+          ./scripts/gen-key.sh
+      - name: Check executor builds
+        run: |
+          export VALIDATOR_PUBLIC_KEY=$(cat public_key.hex)
+          cargo check -p basilica-executor
+      - name: Test executor crate (unit tests only)
+        run: |
+          export VALIDATOR_PUBLIC_KEY=$(cat public_key.hex)
+          cargo nextest run -p basilica-executor --lib
+      - name: Test executor CLI functionality
+        run: |
+          export VALIDATOR_PUBLIC_KEY=$(cat public_key.hex)
+          cargo build -p basilica-executor
+          ./target/debug/basilica-executor --help
+      - name: Clean up space before Docker build
+        run: |
+          docker system prune -af
+          df -h
+      - name: Test Docker build script
+        run: |
+          chmod +x scripts/executor/build.sh
+          export VALIDATOR_PUBLIC_KEY=$(cat public_key.hex)
+          BITTENSOR_NETWORK=finney VALIDATOR_PUBLIC_KEY=$VALIDATOR_PUBLIC_KEY ./scripts/executor/build.sh --no-extract
+
+  # Build and test validator
+  build-validator:
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.validator == 'true' || needs.changes.outputs.workspace == 'true'
+    strategy:
+      matrix:
+        rust-version: [stable]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust-version }}
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "shared-cache"
+      - name: Cache and install system dependencies
+        uses: awalsh128/cache-apt-pkgs-action@latest
+        with:
+          packages: protobuf-compiler pkg-config libssl-dev xxd mold clang
+          version: 1.0
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - name: Set up Docker
+        uses: docker/setup-buildx-action@v3
+      - name: Generate test key
+        run: |
+          chmod +x scripts/gen-key.sh
+          ./scripts/gen-key.sh
+      - name: Check validator builds
+        run: |
+          export VALIDATOR_PUBLIC_KEY=$(cat public_key.hex)
+          cargo check -p basilica-validator
+      - name: Test validator crate (unit tests only)
+        run: |
+          export VALIDATOR_PUBLIC_KEY=$(cat public_key.hex)
+          cargo nextest run -p basilica-validator --all-features
+      - name: Test validator CLI functionality
+        run: |
+          export VALIDATOR_PUBLIC_KEY=$(cat public_key.hex)
+          cargo build -p basilica-validator
+          ./target/debug/basilica-validator --help
+      - name: Clean up space before Docker build
+        run: |
+          docker system prune -af
+          df -h
+      - name: Test Docker build script
+        run: |
+          chmod +x scripts/validator/build.sh
+          export VALIDATOR_PUBLIC_KEY=$(cat public_key.hex)
+          BITTENSOR_NETWORK=finney VALIDATOR_PUBLIC_KEY=$VALIDATOR_PUBLIC_KEY ./scripts/validator/build.sh --no-extract
+
+  # Build and test miner
+  build-miner:
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.miner == 'true' || needs.changes.outputs.workspace == 'true'
+    strategy:
+      matrix:
+        rust-version: [stable]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust-version }}
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "shared-cache"
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "25.x"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Cache and install system dependencies
+        uses: awalsh128/cache-apt-pkgs-action@latest
+        with:
+          packages: pkg-config libssl-dev xxd mold clang
+          version: 1.0
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - name: Set up Docker
+        uses: docker/setup-buildx-action@v3
+      - name: Generate test key
+        run: |
+          chmod +x scripts/gen-key.sh
+          ./scripts/gen-key.sh
+      - name: Check miner builds
+        run: |
+          export VALIDATOR_PUBLIC_KEY=$(cat public_key.hex)
+          cargo check -p basilica-miner
+      - name: Test miner crate (unit tests only)
+        run: |
+          export VALIDATOR_PUBLIC_KEY=$(cat public_key.hex)
+          cargo nextest run -p basilica-miner --lib
+      - name: Test miner CLI functionality
+        run: |
+          export VALIDATOR_PUBLIC_KEY=$(cat public_key.hex)
+          cargo build -p basilica-miner
+          ./target/debug/basilica-miner --help
+      - name: Clean up space before Docker build
+        run: |
+          docker system prune -af
+          df -h
+      - name: Test Docker build script
+        run: |
+          chmod +x scripts/miner/build.sh
+          BITTENSOR_NETWORK=finney ./scripts/miner/build.sh --no-extract
+
+  # Build and test basilica-api
+  build-api:
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.basilica-api == 'true' || needs.changes.outputs.workspace == 'true'
+    strategy:
+      matrix:
+        rust-version: [stable]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust-version }}
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "shared-cache"
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "25.x"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Cache and install system dependencies
+        uses: awalsh128/cache-apt-pkgs-action@latest
+        with:
+          packages: pkg-config libssl-dev xxd mold clang
+          version: 1.0
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - name: Set up Docker
+        uses: docker/setup-buildx-action@v3
+      - name: Generate test key
+        run: |
+          chmod +x scripts/gen-key.sh
+          ./scripts/gen-key.sh
+      - name: Check basilica-api builds
+        run: |
+          export VALIDATOR_PUBLIC_KEY=$(cat public_key.hex)
+          cargo check -p basilica-api
+      - name: Test basilica-api crate (unit tests only)
+        run: |
+          export VALIDATOR_PUBLIC_KEY=$(cat public_key.hex)
+          cargo nextest run -p basilica-api --all-features
+      - name: Test basilica-api CLI functionality
+        run: |
+          export VALIDATOR_PUBLIC_KEY=$(cat public_key.hex)
+          cargo build -p basilica-api
+          ./target/debug/basilica-api --help
+      - name: Clean up space before Docker build
+        run: |
+          docker system prune -af
+          df -h
+      - name: Test Docker build script
+        run: |
+          chmod +x scripts/api/build.sh
+          BITTENSOR_NETWORK=finney ./scripts/api/build.sh --no-extract
+
+  # Build and test basilica-cli
+  build-cli:
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.basilica-cli == 'true' || needs.changes.outputs.workspace == 'true'
+    strategy:
+      matrix:
+        rust-version: [stable]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust-version }}
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "shared-cache"
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "25.x"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Cache and install system dependencies
+        uses: awalsh128/cache-apt-pkgs-action@latest
+        with:
+          packages: pkg-config libssl-dev xxd mold clang
+          version: 1.0
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - name: Check basilica-cli builds
+        run: |
+          cargo check -p basilica-cli
+      - name: Test basilica-cli crate (unit tests only)
+        run: |
+          cargo nextest run -p basilica-cli --all-features
+      - name: Test basilica-cli CLI functionality
+        run: |
+          cargo build -p basilica-cli
+          ./target/debug/basilica --help
+      - name: Set up Docker
+        uses: docker/setup-buildx-action@v3
+      - name: Test Docker build script
+        run: |
+          chmod +x scripts/cli/build.sh
+          BITTENSOR_NETWORK=finney ./scripts/cli/build.sh --no-extract
+
+  # Final status check
+  ci-success:
+    runs-on: ubuntu-latest
+    needs:
+      - quick-checks
+      - lint-complex
+      - build-executor
+      - build-validator
+      - build-miner
+      - build-api
+      - build-cli
+    if: always()
+    steps:
+      - name: Check if all jobs succeeded
+        run: |
+          if [[ "${{ needs.quick-checks.result }}" == "success" && \
+                "${{ needs.lint-complex.result }}" == "success" && \
+                ("${{ needs.build-executor.result }}" == "success" || "${{ needs.build-executor.result }}" == "skipped") && \
+                ("${{ needs.build-validator.result }}" == "success" || "${{ needs.build-validator.result }}" == "skipped") && \
+                ("${{ needs.build-miner.result }}" == "success" || "${{ needs.build-miner.result }}" == "skipped") && \
+                ("${{ needs.build-api.result }}" == "success" || "${{ needs.build-api.result }}" == "skipped") && \
+                ("${{ needs.build-cli.result }}" == "success" || "${{ needs.build-cli.result }}" == "skipped") ]]; then
+            echo "All CI checks passed!"
+            exit 0
+          else
+            echo "Some CI checks failed!"
+            exit 1
+          fi

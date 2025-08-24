@@ -1,0 +1,57 @@
+services:
+  miner:
+    image: ghcr.io/tplr-ai/basilica/miner:latest
+    container_name: basilica-miner
+    restart: unless-stopped
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+
+    environment:
+      - RUST_LOG=debug
+      - RUST_BACKTRACE=1
+
+    volumes:
+      - /opt/basilica/config/miner.toml:/opt/basilica/config/miner.toml:ro
+      - /opt/basilica/data:/opt/basilica/data:rw
+      - ~/.ssh:/opt/basilica/keys:ro
+      - ~/.bittensor:/root/.bittensor:rw
+      - /var/log/basilica:/var/log/basilica:rw
+
+    ports:
+      - "8080:8080"     # Server/API port (from config server.port)
+      - "9090:9090"     # Metrics port (from config metrics.prometheus.port)
+
+    dns:
+      - 1.1.1.1
+      - 1.0.0.1
+
+    networks:
+      - basilica_network
+
+    command: ["--config", "/opt/basilica/config/miner.toml"]
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  watchtower:
+    image: containrrr/watchtower
+    container_name: basilica-watchtower
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - WATCHTOWER_CLEANUP=true
+      - WATCHTOWER_POLL_INTERVAL=60
+      - WATCHTOWER_LABEL_ENABLE=true
+    dns:
+      - 1.1.1.1
+      - 1.0.0.1
+    command: --label-enable --cleanup --interval 60
+
+networks:
+  basilica_network:
+    driver: bridge

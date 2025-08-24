@@ -1,0 +1,94 @@
+services:
+  validator:
+    image: ghcr.io/tplr-ai/basilica/validator:latest
+    container_name: basilica-validator
+    restart: unless-stopped
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+
+    privileged: true
+
+    environment:
+      - RUST_LOG=debug
+      - RUST_BACKTRACE=1
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+    volumes:
+      - /opt/basilica/config/validator.toml:/opt/basilica/config/validator.toml:ro
+      - /opt/basilica/data:/opt/basilica/data:rw
+      - ~/.ssh:/opt/basilica/keys:ro
+      - ~/.bittensor:/root/.bittensor:rw
+      - /var/log/basilica:/var/log/basilica:rw
+
+    ports:
+      - "8080:8080"     # Server/API port
+      - "9090:9090"     # Metrics port
+
+    dns:
+      - 1.1.1.1
+      - 1.0.0.1
+
+    networks:
+      - basilica_network
+
+    command: ["--config", "/opt/basilica/config/validator.toml", "start"]
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  watchtower:
+    image: containrrr/watchtower
+    container_name: basilica-watchtower
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - WATCHTOWER_CLEANUP=true
+      - WATCHTOWER_POLL_INTERVAL=60
+      - WATCHTOWER_LABEL_ENABLE=true
+    dns:
+      - 1.1.1.1
+      - 1.0.0.1
+    command: --label-enable --cleanup --interval 60
+
+  alloy:
+    image: grafana/alloy:latest
+    container_name: basilica-alloy
+    restart: unless-stopped
+    volumes:
+      - ./telemetry/config.alloy:/etc/alloy/config.alloy:ro
+      - /var/log/basilica:/var/log/basilica:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      - ALLOY_CONFIG_FILE=/etc/alloy/config.alloy
+      # Set these values to match your validator.toml config
+      - VALIDATOR_IP=123.123.123.123  # From [bittensor] external_ip or [server] advertised_host
+      - VALIDATOR_UID=999             # The UID of your validator
+      - NETUID=39                     # From [bittensor] netuid
+    ports:
+      - "12345:12345"
+    networks:
+      - basilica_network
+    depends_on:
+      - validator
+    dns:
+      - 1.1.1.1
+      - 1.0.0.1
+
+networks:
+  basilica_network:
+    driver: bridge
+    name: basilica_network
